@@ -81,7 +81,7 @@ app.post("/users/", authenticate, (req, res) => {
 
       const newAccountData = {
         associatedUser: authUserId,
-        name: `Conta Principal - ${req.body.name}`,
+        name: req.body.name,
         balance: 4000,
         createdAt: new Date().toISOString(),
       };
@@ -213,7 +213,7 @@ app.post("/bankAccounts", authenticate, async (req, res) => {
     const newAccountData = {
       associatedUser: userId,
       balance: parseFloat(initialBalance) || 5000,
-      createdAt: new Date().toISOString(),
+      createdAt: new Date(),
     };
 
     const docRef = await database
@@ -324,7 +324,7 @@ app.post("/transactions", authenticate, async (req, res) => {
 
         if (fromDoc.data().associatedUser !== userId) {
           throw new Error(
-            "Permissão negada. Você não é o dono da conta de origem.",
+            "Permissão negada. Você não é o dono da conta de origem."
           );
         }
 
@@ -343,7 +343,7 @@ app.post("/transactions", authenticate, async (req, res) => {
 
         const senderUID = fromDoc.data().associatedUser; // UID do Remetente (usuário logado)
         const receiverUID = toDoc.data().associatedUser; // UID do Recebedor (dono da conta de destino)
-        const dateString = new Date().toISOString();
+        const dateString = new Date();
         console.log({ senderUID }, fromDoc.data());
         const baseTransactionRef = database.collection("transactions").doc();
 
@@ -360,9 +360,6 @@ app.post("/transactions", authenticate, async (req, res) => {
           name: fromDoc.data().name,
         };
 
-        // 🚨 NOVO LOG DE DIAGNÓSTICO: O QUE SERÁ ESCRITO?
-        console.log(`[DOC REMETENTE] Gravando 'sended' para UID: ${senderUID}`);
-
         transaction.set(baseTransactionRef, senderTransactionData);
 
         const receiverTransactionData = {
@@ -377,12 +374,7 @@ app.post("/transactions", authenticate, async (req, res) => {
           createdAt: dateString,
           name: toDoc.data().name,
         };
-        // 🚨 NOVO LOG DE DIAGNÓSTICO: O QUE SERÁ ESCRITO?
-        console.log(
-          `[DOC RECEBEDOR] Gravando 'received' para UID: ${receiverUID}`,
-        );
 
-        // Criar um SEGUNDO documento com o mesmo conteúdo base, mas ID diferente
         const receiverTransactionRef = database
           .collection("transactions")
           .doc();
@@ -392,7 +384,7 @@ app.post("/transactions", authenticate, async (req, res) => {
           senderId: baseTransactionRef.id,
           receiverId: receiverTransactionRef.id,
         };
-      },
+      }
     );
 
     return res.status(201).send({
@@ -421,14 +413,55 @@ app.post("/transactions", authenticate, async (req, res) => {
 
 app.get("/transactions", authenticate, async (req, res) => {
   try {
-    console.log(req.user);
-    const userId = req.user.user_id; // O UID do usuário autenticado
+    const userId = req.user.user_id;
+    const { minAmount, maxAmount, month } = req.query;
 
-    // ⭐️ A QUERY principal: Busca transações onde associatedUser é igual ao ID logado
-    const query = database
+    const minAmountValue = minAmount ? parseFloat(minAmount) : null;
+    const maxAmountValue = maxAmount ? parseFloat(maxAmount) : null;
+    let query = database
       .collection("transactions")
       .where("associatedUser", "==", userId)
-      .orderBy("date", "desc"); // Ordena pela data, mais recente primeiro
+      .orderBy("date", "desc");
+
+    if (minAmountValue !== null) {
+      query = query.where("amount", ">=", minAmountValue);
+    }
+
+    if (maxAmountValue !== null) {
+      query = query.where("amount", "<=", maxAmountValue);
+    }
+    console.log({ maxAmount, queries: req.query });
+
+    if (month) {
+      const [monthStr, yearStr] = month.split("-");
+      const monthNum = parseInt(monthStr, 10);
+      let yearNum = parseInt(yearStr, 10);
+
+      // 🔑 CORREÇÃO CRÍTICA: Converta o ano de 2 dígitos (ex: 25) para 4 dígitos (2025)
+      // Assumimos que qualquer ano menor que 100 é do século 21.
+      if (yearNum < 100) {
+        yearNum += 2000;
+      }
+
+      if (monthNum >= 1 && monthNum <= 12 && yearNum) {
+        // Início do Mês: YYYY-MM-01
+        const start = new Date(yearNum, monthNum - 1, 1);
+        // Fim do Mês: Início do Mês Seguinte
+        const end = new Date(yearNum, monthNum, 1);
+
+        // O Firestore compara strings lexicograficamente (alfabeticamente),
+        // e o formato ISO String é seguro para isso.
+        const startISODate = start.toISOString();
+        const endISODate = end.toISOString();
+
+        const startTimestamp = admin.firestore.Timestamp.fromDate(startISODate);
+        const endTimestamp = admin.firestore.Timestamp.fromDate(endISODate);
+
+        // Aplica o filtro de intervalo (range)
+        query = query.where("date", ">=", startTimestamp);
+        query = query.where("date", "<", endTimestamp);
+      }
+    }
 
     const querySnapshot = await query.get();
 
