@@ -1,33 +1,66 @@
+/* =========================================================================
+ * ⚙️ CONFIGURAÇÕES E IMPORTS GLOBAIS
+ * ========================================================================= */
+
 /* eslint-disable no-unused-vars */
 /* eslint-disable valid-jsdoc */
 /* eslint-disable object-curly-spacing */
 /* eslint-disable max-len */
 /* eslint-disable indent */
-const { onRequest } = require("firebase-functions/v2/https");
-// const logger = require("firebase-functions/logger");
-const { setGlobalOptions } = require("firebase-functions/v2");
-setGlobalOptions({ maxInstances: 10 });
 
+// Dependências do Firebase Cloud Functions
+const { onRequest } = require("firebase-functions/v2/https");
+const { setGlobalOptions } = require("firebase-functions/v2");
+const functions = require("firebase-functions");
+
+// Dependências do Firebase Admin SDK
 const admin = require("firebase-admin");
 
+// Dependências de Utilidades e Servidor
+const express = require("express");
+const cors = require("cors");
 const crypto = require("crypto");
+const multer = require("multer"); // Multer não está sendo usado nas rotas, mas é mantido como dependência.
 
+// Dependências para Upload (Busboy)
+const busboy = require("busboy");
+const path = require("path");
+const os = require("os");
+const fs = require("fs");
+
+// Configurações Globais para a 2ª Geração (se aplicável)
+setGlobalOptions({ maxInstances: 10 });
+
+// Arquivo de Permissões
 const serviceAccount = require("./permisions.json");
+const { uid } = require("uuid");
 
+/* -------------------------------------------------------------------------
+ * 🚀 INICIALIZAÇÃO E CONFIGURAÇÃO DO FIREBASE ADMIN
+ * ------------------------------------------------------------------------- */
+
+// Inicialização do Admin SDK
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
+  storageBucket: "api-prime-bank.firebasestorage.app", // Seu bucket do Storage
 });
 
-const express = require("express");
+// Instâncias Globais do Firebase
+const database = admin.firestore();
+const bucket = admin.storage().bucket();
+
+/* -------------------------------------------------------------------------
+ * 🌐 CONFIGURAÇÃO DO SERVIDOR EXPRESS (API Principal)
+ * ------------------------------------------------------------------------- */
 
 const app = express();
-const cors = require("cors");
-const database = admin.firestore();
+
+// Middlewares
 app.use(cors({ origin: true }));
 
-// ====================================================================================================
-// ⭐️ MIDDLEWARE DE AUTENTICAÇÃO (Adicionado)
-// ====================================================================================================
+/* -------------------------------------------------------------------------
+ * 🛡️ MIDDLEWARE DE AUTENTICAÇÃO
+ * ------------------------------------------------------------------------- */
 
 /**
  * Middleware para verificar o Token de ID do Firebase no cabeçalho Authorization.
@@ -44,13 +77,9 @@ const authenticate = async (req, res, next) => {
   const idToken = authHeader.split("Bearer ")[1];
 
   try {
-    // Verifica e decodifica o Token de ID do Firebase
     const decodedToken = await admin.auth().verifyIdToken(idToken);
-
-    // Anexa o objeto do usuário (com UID) à requisição
+    console.log({ decodedToken });
     req.user = decodedToken;
-
-    // Continua para a próxima função (o handler da rota)
     next();
   } catch (error) {
     console.error("Erro ao verificar o Token de ID:", error);
@@ -58,65 +87,95 @@ const authenticate = async (req, res, next) => {
   }
 };
 
-// ====================================================================================================
-// ---------------------------------------------------------------------------------------------> Routes USERS
-// ====================================================================================================
+/**
+ * Função auxiliar que verifica o token de ID e retorna os dados do usuário.
+ * @param {object} req O objeto de requisição (req).
+ * @returns {object} O token decodificado (decodedToken).
+ * @throws {Error} Se o token for inválido ou ausente.
+ */
+async function getAuthenticatedUser(req) {
+  const authHeader = req.headers.authorization;
 
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    throw new Error("Acesso negado. Token não fornecido ou formato inválido.");
+  }
+
+  const idToken = authHeader.split("Bearer ")[1];
+
+  try {
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    return decodedToken; // <-- Retorna o token decodificado!
+  } catch (error) {
+    console.error("Erro ao verificar o Token de ID:", error);
+    // Lançamos um erro com a mensagem que queremos exibir
+    throw new Error("Token inválido ou expirado.");
+  }
+}
+
+/* =========================================================================
+ * 🛣️ ROTAS DA API (EXPRESS)
+ * ========================================================================= */
+
+// ---------------------------------------------------------------------------> Rotas USERS
 // Post (CREATE): Cria usuário e uma conta bancária inicial
+app.post("/users", async (req, res) => {
+  const { fullName, email, password, telephone, acceptTermAndPolice } =
+    req.body;
 
-app.post("/users/", authenticate, (req, res) => {
-  (authenticate,
-  async () => {
-    try {
-      const authUserId = req.user.user_id;
-      const userDocRef = database.collection("users").doc(authUserId);
+  try {
+    const userRecord = await admin.auth().createUser({
+      email: email,
+      password: password,
+      displayName: fullName,
+      // Você pode definir o emailVerified como true se tiver um processo de verificação externo
+      emailVerified: false,
+      disabled: false,
+    });
 
-      await userDocRef.set({
-        name: req.body.name,
-        email: req.body.email,
-        telephone: req.body.telephone,
-        acceptTermAndPolice: req.body.acceptTermAndPolice,
-        createdAt: new Date().toISOString(),
-      });
+    const userDocRef = database.collection("users").doc(userRecord.uid);
 
-      const newAccountData = {
-        associatedUser: authUserId,
-        name: req.body.name,
-        balance: 4000,
-        createdAt: new Date().toISOString(),
-      };
+    await userDocRef.set({
+      fullName: fullName,
+      email: email,
+      telephone: telephone,
+      acceptTermAndPolice: acceptTermAndPolice,
+      createdAt: new Date().toISOString(),
+    });
 
-      const accountRef = await database
-        .collection("bankAccounts")
-        .add(newAccountData);
+    const newAccountData = {
+      associatedUser: userRecord.uid,
+      name: fullName,
+      balance: 4000,
+      createdAt: new Date().toISOString(),
+    };
 
-      return res.status(200).send({
-        message: "Usuário e Conta Principal criados com sucesso!",
-        userId: authUserId,
-        bankAccountId: accountRef.id,
-        bankAccountNumber: crypto.randomUUID(),
-      });
-    } catch (error) {
-      console.log(error);
+    const accountRef = await database
+      .collection("bankAccounts")
+      .add(newAccountData);
 
-      return res.status(500).send(error);
-    }
-  })();
+    return res.status(200).send({
+      message: "Usuário e Conta Principal criados com sucesso!",
+      userId: userRecord.uid,
+      bankAccountId: accountRef.id,
+      bankAccountNumber: crypto.randomUUID(),
+    });
+  } catch (error) {
+    console.log(error);
+    return res.status(500).send(error);
+  }
 });
+
 
 // read all users (READ): APENAS PARA DEBUG
 app.get("/users/", authenticate, async (req, res) => {
   try {
     console.log({ user: req.user });
-
     const query = database.collection("users");
     const querySnapshot = await query.get();
-
     const response = querySnapshot.docs.map((doc) => ({
       id: doc.id,
       ...doc.data(),
     }));
-
     return res.status(200).send(response);
   } catch (error) {
     console.error("Erro ao buscar usuários:", error);
@@ -127,7 +186,8 @@ app.get("/users/", authenticate, async (req, res) => {
   }
 });
 
-app.get("/users/:id", authenticate, authenticate, async (req, res) => {
+// read user by ID
+app.get("/users/:id", authenticate, async (req, res) => {
   try {
     const userId = req.params.id;
     const userRef = database.collection("users").doc(userId);
@@ -140,7 +200,6 @@ app.get("/users/:id", authenticate, authenticate, async (req, res) => {
     const userData = {
       ...doc.data(),
     };
-
     return res.status(200).send(userData);
   } catch (error) {
     console.error("Erro ao buscar usuário:", error);
@@ -151,6 +210,7 @@ app.get("/users/:id", authenticate, authenticate, async (req, res) => {
   }
 });
 
+// Update user
 app.put("/users/:id", authenticate, async (req, res) => {
   try {
     const userId = req.params.id;
@@ -177,6 +237,7 @@ app.put("/users/:id", authenticate, async (req, res) => {
   }
 });
 
+// Delete user
 app.delete("/users/:id", authenticate, async (req, res) => {
   try {
     const userId = req.params.id;
@@ -202,9 +263,8 @@ app.delete("/users/:id", authenticate, async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------------------------------> CONTA BANCÁRIA
-// (Você tinha um '/product/:id' e um '/routes transactions' aqui, mantidos como referência)
-
+// ---------------------------------------------------------------------------> Rotas CONTA BANCÁRIA
+// Create bank account
 app.post("/bankAccounts", authenticate, async (req, res) => {
   try {
     const userId = req.user.user_id;
@@ -234,12 +294,12 @@ app.post("/bankAccounts", authenticate, async (req, res) => {
   }
 });
 
+// Read all bank accounts
 app.get("/bankAccounts", authenticate, async (req, res) => {
   try {
     const query = database
       .collection("bankAccounts")
       .orderBy("createdAt", "asc");
-
     const querySnapshot = await query.get();
 
     const bankAccounts = querySnapshot.docs.map((doc) => ({
@@ -257,11 +317,11 @@ app.get("/bankAccounts", authenticate, async (req, res) => {
   }
 });
 
+// Read bank account by ID
 app.get("/bankAccounts/:id", authenticate, async (req, res) => {
   try {
     const accountDocId = req.params.id;
     const userId = req.user.user_id;
-    console.log({ userId });
 
     const docRef = database.collection("bankAccounts").doc(accountDocId);
     const doc = await docRef.get();
@@ -291,14 +351,13 @@ app.get("/bankAccounts/:id", authenticate, async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------------------------------> Outras Rotas
-// (Você tinha um '/product/:id' e um '/routes transactions' aqui, mantidos como referência)
-// APENAS TRANSFERÊNCIAS
-// app.post("/transactions", authenticate, async (req, res) => {
+// ---------------------------------------------------------------------------> Rotas TRANSACTIONS
+// Create transaction (Transferência)
 app.post("/transactions", authenticate, async (req, res) => {
   const userId = req.user.user_id;
-
-  const { fromAccountId, toAccountId, amount, anexo, urlAnexo } = req.body;
+  const { fromAccountId, toAccountId, amount, category } = req.body;
+  let fileUrl;
+  let fileName;
 
   if (!fromAccountId || !toAccountId || !amount || amount <= 0) {
     return res
@@ -306,11 +365,21 @@ app.post("/transactions", authenticate, async (req, res) => {
       .send({ message: "Dados de transação inválidos ou incompletos." });
   }
 
-  // Referências aos documentos
   const fromAccountRef = database.collection("bankAccounts").doc(fromAccountId);
   const toAccountRef = database.collection("bankAccounts").doc(toAccountId);
-
+  // content-type': 'multipart/form-data
   try {
+    // if (req.headers["content-type"] === "multipart/form-data") {
+    //   const response = await fetch(
+    //     "http://127.0.0.1:5001/api-prime-bank/us-central1/uploadFile",
+    //     {
+    //       method: "POST",
+    //     }
+    //   );
+
+    //   console.log({ response });
+    // }
+
     const transactionRefs = await database.runTransaction(
       async (transaction) => {
         const fromDoc = await transaction.get(fromAccountRef);
@@ -320,11 +389,9 @@ app.post("/transactions", authenticate, async (req, res) => {
           throw new Error("Uma das contas bancárias não foi encontrada.");
         }
 
-        // 🚨 NOVO LOG DE DIAGNÓSTICO: O QUE ESTÁ SENDO USADO?
-
         if (fromDoc.data().associatedUser !== userId) {
           throw new Error(
-            "Permissão negada. Você não é o dono da conta de origem."
+            "Permissão negada. Você não é o dono da conta de origem.",
           );
         }
 
@@ -341,10 +408,9 @@ app.post("/transactions", authenticate, async (req, res) => {
         transaction.update(fromAccountRef, { balance: newFromBalance });
         transaction.update(toAccountRef, { balance: newToBalance });
 
-        const senderUID = fromDoc.data().associatedUser; // UID do Remetente (usuário logado)
-        const receiverUID = toDoc.data().associatedUser; // UID do Recebedor (dono da conta de destino)
+        const senderUID = fromDoc.data().associatedUser;
+        const receiverUID = toDoc.data().associatedUser;
         const dateString = new Date();
-        console.log({ senderUID }, fromDoc.data());
         const baseTransactionRef = database.collection("transactions").doc();
 
         const senderTransactionData = {
@@ -352,12 +418,13 @@ app.post("/transactions", authenticate, async (req, res) => {
           toAccountId: toAccountId,
           amount: transferAmount,
           date: dateString,
-          anexo: anexo || null,
-          urlAnexo: urlAnexo || null,
+          fileName: fileName || null,
+          fileUrl: fileUrl || null,
           associatedUser: senderUID,
           type: "sended",
           createdAt: dateString,
           name: fromDoc.data().name,
+          category: category,
         };
 
         transaction.set(baseTransactionRef, senderTransactionData);
@@ -367,12 +434,13 @@ app.post("/transactions", authenticate, async (req, res) => {
           toAccountId: toAccountId,
           amount: transferAmount,
           date: dateString,
-          anexo: anexo || null,
-          urlAnexo: urlAnexo || null,
+          fileName: fileName || null,
+          fileUrl: fileUrl || null,
           associatedUser: receiverUID,
           type: "received",
           createdAt: dateString,
           name: toDoc.data().name,
+          category: category,
         };
 
         const receiverTransactionRef = database
@@ -384,7 +452,7 @@ app.post("/transactions", authenticate, async (req, res) => {
           senderId: baseTransactionRef.id,
           receiverId: receiverTransactionRef.id,
         };
-      }
+      },
     );
 
     return res.status(201).send({
@@ -411,58 +479,66 @@ app.post("/transactions", authenticate, async (req, res) => {
   }
 });
 
+// Read all transactions with filters and pagination
 app.get("/transactions", authenticate, async (req, res) => {
   try {
     const userId = req.user.user_id;
-    const { minAmount, maxAmount, month } = req.query;
+    const { minAmount, maxAmount, month, itemsPerPage, lastItemId } = req.query;
 
     const minAmountValue = minAmount ? parseFloat(minAmount) : null;
     const maxAmountValue = maxAmount ? parseFloat(maxAmount) : null;
+    const pageSize = parseInt(itemsPerPage, 10) || 100;
+
     let query = database
       .collection("transactions")
       .where("associatedUser", "==", userId)
       .orderBy("date", "desc");
 
+    // 1. Aplicação dos Filtros de Quantidade
     if (minAmountValue !== null) {
       query = query.where("amount", ">=", minAmountValue);
     }
-
     if (maxAmountValue !== null) {
       query = query.where("amount", "<=", maxAmountValue);
     }
-    console.log({ maxAmount, queries: req.query });
 
+    // 2. Aplicação do Filtro por Mês
     if (month) {
       const [monthStr, yearStr] = month.split("-");
       const monthNum = parseInt(monthStr, 10);
       let yearNum = parseInt(yearStr, 10);
 
-      // 🔑 CORREÇÃO CRÍTICA: Converta o ano de 2 dígitos (ex: 25) para 4 dígitos (2025)
-      // Assumimos que qualquer ano menor que 100 é do século 21.
       if (yearNum < 100) {
         yearNum += 2000;
       }
 
       if (monthNum >= 1 && monthNum <= 12 && yearNum) {
-        // Início do Mês: YYYY-MM-01
         const start = new Date(yearNum, monthNum - 1, 1);
-        // Fim do Mês: Início do Mês Seguinte
         const end = new Date(yearNum, monthNum, 1);
 
-        // O Firestore compara strings lexicograficamente (alfabeticamente),
-        // e o formato ISO String é seguro para isso.
-        const startISODate = start.toISOString();
-        const endISODate = end.toISOString();
+        const startTimestamp = admin.firestore.Timestamp.fromDate(start);
+        const endTimestamp = admin.firestore.Timestamp.fromDate(end);
 
-        const startTimestamp = admin.firestore.Timestamp.fromDate(startISODate);
-        const endTimestamp = admin.firestore.Timestamp.fromDate(endISODate);
-
-        // Aplica o filtro de intervalo (range)
         query = query.where("date", ">=", startTimestamp);
         query = query.where("date", "<", endTimestamp);
       }
     }
 
+    // 3. Paginação
+    if (lastItemId) {
+      const cursorDoc = await database
+        .collection("transactions")
+        .doc(lastItemId)
+        .get();
+
+      if (cursorDoc.exists) {
+        query = query.startAfter(cursorDoc);
+      }
+    }
+
+    query = query.limit(pageSize);
+
+    // 4. Execução
     const querySnapshot = await query.get();
 
     const transactions = querySnapshot.docs.map((doc) => ({
@@ -470,7 +546,19 @@ app.get("/transactions", authenticate, async (req, res) => {
       ...doc.data(),
     }));
 
-    return res.status(200).send(transactions);
+    // 5. Retorno da Paginação
+    const lastDoc = querySnapshot.docs[querySnapshot.docs.length - 1];
+    const nextCursorId = lastDoc ? lastDoc.id : null;
+    const hasMore = querySnapshot.docs.length === pageSize;
+
+    return res.status(200).send({
+      data: transactions,
+      pagination: {
+        itemsPerPage: pageSize,
+        nextCursorId: nextCursorId,
+        hasMore: hasMore,
+      },
+    });
   } catch (error) {
     console.error("Erro ao listar transações:", error);
     return res.status(500).send({
@@ -480,6 +568,7 @@ app.get("/transactions", authenticate, async (req, res) => {
   }
 });
 
+// Read transaction by ID
 app.get("/transactions/:id", authenticate, async (req, res) => {
   try {
     const transactionId = req.params.id;
@@ -494,7 +583,7 @@ app.get("/transactions/:id", authenticate, async (req, res) => {
 
     const transactionData = { id: doc.id, ...doc.data() };
 
-    // ⭐️ VERIFICAÇÃO DE PROPRIEDADE: Garante que o usuário só veja suas próprias transações
+    // ⭐️ VERIFICAÇÃO DE PROPRIEDADE
     if (transactionData.associatedUser !== userId) {
       return res.status(403).send({
         message: "Acesso negado. Esta transação não pertence ao seu usuário.",
@@ -511,6 +600,7 @@ app.get("/transactions/:id", authenticate, async (req, res) => {
   }
 });
 
+// Update transaction
 app.put("/transactions/:id", authenticate, async (req, res) => {
   try {
     const transactionId = req.params.id;
@@ -532,7 +622,6 @@ app.put("/transactions/:id", authenticate, async (req, res) => {
       });
     }
 
-    // Previne que o usuário mude o campo de associação
     delete updateData.associatedUser;
 
     await docRef.update(updateData);
@@ -549,6 +638,7 @@ app.put("/transactions/:id", authenticate, async (req, res) => {
   }
 });
 
+// Delete transaction
 app.delete("/transactions/:id", authenticate, async (req, res) => {
   try {
     const transactionId = req.params.id;
@@ -583,50 +673,43 @@ app.delete("/transactions/:id", authenticate, async (req, res) => {
   }
 });
 
-// INVESTIMENTOS
+// ---------------------------------------------------------------------------> Rotas INVESTMENTS
+// Create investment
+// app.post("/investments", authenticate, async (req, res) => {
+//   try {
+//     const userId = req.user.user_id;
 
-exports.app = onRequest(app);
+//     const newInvestmentData = {
+//       type: type,
+//       value: req.body.value,
+//       name: req.body.name,
+//       accountId: req.body.accountId,
+//       associatedUser: userId,
+//       createdAt: new Date().toISOString(),
+//     };
 
-app.post("/investments", authenticate, async (req, res) => {
-  try {
-    const userId = req.user.user_id;
+//     const docRef = await database
+//       .collection("investments")
+//       .add(newInvestmentData);
 
-    const newInvestmentData = {
-      // Campos de Investimento:
-      type: req.body.type, // Tipo (ex: 'stock', 'bond', 'fund')
-      value: req.body.value,
-      name: req.body.name,
-      accountId: req.body.accountId, // ID da conta bancária/corretora associada
+//     return res.status(201).send({
+//       message: "Investimento registrado com sucesso.",
+//       id: docRef.id,
+//     });
+//   } catch (error) {
+//     console.error("Erro ao criar investimento:", error);
+//     return res.status(500).send({
+//       message: "Erro interno do servidor ao registrar investimento.",
+//       error: error.message,
+//     });
+//   }
+// });
 
-      // ⭐️ Associa o investimento ao usuário logado:
-      associatedUser: userId,
-
-      // Data de criação
-      createdAt: new Date().toISOString(),
-    };
-
-    const docRef = await database
-      .collection("investments")
-      .add(newInvestmentData);
-
-    return res.status(201).send({
-      message: "Investimento registrado com sucesso.",
-      id: docRef.id,
-    });
-  } catch (error) {
-    console.error("Erro ao criar investimento:", error);
-    return res.status(500).send({
-      message: "Erro interno do servidor ao registrar investimento.",
-      error: error.message,
-    });
-  }
-});
-
+// Read all investments
 app.get("/investments", authenticate, async (req, res) => {
   try {
     const userId = req.user.user_id;
 
-    // Busca investimentos onde associatedUser é igual ao ID logado
     const query = database
       .collection("investments")
       .where("associatedUser", "==", userId)
@@ -649,6 +732,7 @@ app.get("/investments", authenticate, async (req, res) => {
   }
 });
 
+// Read investment by ID
 app.get("/investments/:id", authenticate, async (req, res) => {
   try {
     const investmentId = req.params.id;
@@ -681,6 +765,7 @@ app.get("/investments/:id", authenticate, async (req, res) => {
   }
 });
 
+// Update investment
 app.put("/investments/:id", authenticate, async (req, res) => {
   try {
     const investmentId = req.params.id;
@@ -702,7 +787,6 @@ app.put("/investments/:id", authenticate, async (req, res) => {
       });
     }
 
-    // Previne a mudança do campo de associação por segurança
     delete updateData.associatedUser;
 
     await docRef.update(updateData);
@@ -719,6 +803,7 @@ app.put("/investments/:id", authenticate, async (req, res) => {
   }
 });
 
+// Delete investment
 app.delete("/investments/:id", authenticate, async (req, res) => {
   try {
     const investmentId = req.params.id;
@@ -752,4 +837,161 @@ app.delete("/investments/:id", authenticate, async (req, res) => {
     });
   }
 });
+
+/* =========================================================================
+ * 🖼️ FUNÇÃO DE UPLOAD (BUSBOY)
+ * ========================================================================= */
+
+// exports.uploadFile = functions.https.onRequest(async (req, res) => {
+//   // Remova o 'next' daqui, pois não é uma função Express
+//   if (req.method !== "POST") {
+//     return res.status(405).send("Método não permitido. Use POST.");
+//   }
+
+//   // ⚠️ Remova a definição da função 'authenticate' antiga daqui
+
+//   // 1. AUTENTICAÇÃO: Chamada da função auxiliar
+//   let userId = null;
+//   try {
+//     // Chamamos a nova função que retorna o token ou lança um erro.
+//     const decodedToken = await getAuthenticatedUser(req);
+//     userId = decodedToken.uid; // Agora funciona!
+//   } catch (error) {
+//     // Se a autenticação falhar, retorna o erro (e o error.message é o que queremos)
+//     return res.status(401).send({ message: error.message });
+//   }
+
+//   // Se chegou aqui, o usuário está autenticado e temos o 'userId'
+
+//   // 2. INÍCIO DO BUSBOY...
+//   const busboyHeaders = busboy({
+//     headers: req.headers,
+//     limits: {
+//       fileSize: 10 * 1024 * 1024, // 10MB
+//     },
+//   });
+
+//   // ... (restante do código do Busboy: on("field"), on("file"), on("finish")) ...
+//   // Certifique-se de usar o restante do seu código Busboy aqui, sem a definição do middleware 'authenticate' dentro.
+//   // ...
+
+//   const fields = {};
+//   const uploads = {};
+
+//   busboyHeaders.on("field", (fieldname, val) => {
+//     fields[fieldname] = val;
+//   });
+
+//   busboyHeaders.on("file", (fieldname, file, info) => {
+//     // Usar 'file' ou 'attachment' como nome do campo
+//     if (fieldname !== "file" && fieldname !== "attachment") {
+//       file.resume();
+//       return;
+//     }
+
+//     const { filename, mimeType } = info;
+//     const uniqueFileName = `${Date.now()}-${filename.replace(/ /g, "_")}`;
+//     const filepath = path.join(os.tmpdir(), uniqueFileName);
+
+//     uploads.file = {
+//       originalName: filename,
+//       filename: uniqueFileName,
+//       mimeType: mimeType,
+//       filepath: filepath,
+//     };
+
+//     file.pipe(fs.createWriteStream(filepath));
+//   });
+
+//   busboyHeaders.on("finish", async () => {
+//     try {
+//       if (!uploads.file) {
+//         return res.status(400).send({
+//           message: "Nenhum arquivo enviado ou campo de arquivo incorreto.",
+//         });
+//       }
+
+//       const { filename, mimeType, filepath, originalName } = uploads.file;
+
+//       // 3. ASSOCIAÇÃO: Usa o UID na pasta de destino
+//       const destinationPath = `files/${userId}/${filename}`;
+
+//       const metadata = {
+//         contentType: mimeType,
+//         metadata: {
+//           firebaseStorageDownloadTokens: require("uuid").v4(),
+//           originalName: originalName,
+//           uploadedBy: userId, // Salva o UID nos metadados do arquivo
+//         },
+//       };
+
+//       await bucket.upload(filepath, {
+//         destination: destinationPath,
+//         metadata: metadata,
+//         gzip: true,
+//       });
+
+//       const publicUrl = `https://firebasestorage.googleapis.com/v0/b/${
+//         bucket.name
+//       }/o/${encodeURIComponent(destinationPath)}?alt=media&token=${
+//         metadata.metadata.firebaseStorageDownloadTokens
+//       }`;
+
+//       // 4. ATUALIZAR O FIRESTORE
+//       // --------------------------------------------------------------------------------------------------
+//       // ATENÇÃO: É crucial que a variável 'db' esteja definida e seja o resultado de admin.firestore()
+//       // Se não estiver definida, você deve adicionar: const db = admin.firestore(); no topo do arquivo.
+//       // --------------------------------------------------------------------------------------------------
+
+//       const userRef = database.collection("users").doc(userId);
+
+//       await userRef.update({
+//         // Adicionando 'fileUrl' para a URL pública
+//         fileUrl: publicUrl,
+//         // Adicionando 'fileName' para o nome único do arquivo no Storage
+//         fileName: filename,
+//         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+//       });
+
+//       // --------------------------------------------------------------------------------------------------
+
+//       fs.unlinkSync(filepath);
+
+//       res.status(200).send({
+//         message:
+//           "Upload de arquivo realizado com sucesso e usuário atualizado!",
+//         userId: userId,
+//         fileName: filename,
+//         url: publicUrl,
+//         path: destinationPath,
+//       });
+//     } catch (error) {
+//       console.error(
+//         "Erro no upload, processamento ou atualização do Firestore:",
+//         error,
+//       );
+//       if (uploads.file && fs.existsSync(uploads.file.filepath)) {
+//         fs.unlinkSync(uploads.file.filepath);
+//       }
+//       res.status(500).send({
+//         message: "Falha no upload do arquivo ou na atualização do usuário.",
+//         error: error.message,
+//       });
+//     }
+//   });
+
+//   busboyHeaders.end(req.rawBody);
+// });
+
+/* =========================================================================
+ * 📤 EXPORTAÇÃO DAS CLOUD FUNCTIONS
+ * ========================================================================= */
+
+/**
+ * Cloud Function para a API REST (Express).
+ * Roteia todas as requisições HTTP para o nosso app Express.
+ */
+// exports.app = onRequest(app);
+
+// A função 'uploadImage' já foi exportada acima.
 
